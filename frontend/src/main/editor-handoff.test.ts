@@ -3,7 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
-import { createEditorHandoff, type EditorHandoffDeps } from "./editor-handoff";
+import { createEditorHandoff, createExecutableProbe, type EditorHandoffDeps } from "./editor-handoff";
 
 function deps(overrides: Partial<EditorHandoffDeps> = {}): EditorHandoffDeps {
 	return {
@@ -986,5 +986,73 @@ describe("chat path actions", () => {
 		expect(input.launch).toHaveBeenCalledWith("C:\\Windows\\System32\\cmd.exe", ["/d", "/s", "/v:off", "/c", '"start "" "C:\\bin\\nvim.exe" "C:\\worktrees\\ao-1\\src\\a b.ts""'], "C:\\worktrees\\ao-1\\src");
 		await expect(createEditorHandoff(input).pathAction({ sessionId: "ao-1", path: "src/%TEMP%.ts", action: "open", editorId: "neovim" })).rejects.toThrow("safely");
 		expect(input.launch).toHaveBeenCalledTimes(1);
+	});
+});
+
+describe("executable probe", () => {
+	// A fake Windows disk: directory -> the names it holds.
+	function winDisk(directories: Record<string, string[]>, unlistable: string[] = []) {
+		const readdirSync = vi.fn((directory: string) => {
+			if (unlistable.includes(directory)) throw Object.assign(new Error("denied"), { code: "EACCES" });
+			const names = directories[directory];
+			if (!names) throw Object.assign(new Error("missing"), { code: "ENOENT" });
+			return names;
+		});
+		const statSync = vi.fn((candidatePath: string) => {
+			const names = directories[path.win32.dirname(candidatePath)] ?? [];
+			if (!names.some((name) => name.toLowerCase() === path.win32.basename(candidatePath).toLowerCase())) throw new Error("missing");
+			return { isFile: () => true, mode: 0 };
+		});
+		return { readdirSync, statSync };
+	}
+
+	it("lists a Windows directory once and stats only the names it holds", () => {
+		const disk = winDisk({ "C:\\bin": ["Code.CMD", "notes.txt"] });
+		const probe = createExecutableProbe("win32", disk);
+		for (const name of ["code.com", "code.exe", "code.bat", "cursor.exe", "zed.exe"]) expect(probe.isExecutable(`C:\\bin\\${name}`)).toBe(false);
+		// Windows names match whatever their case.
+		expect(probe.isExecutable("C:\\bin\\code.cmd")).toBe(true);
+		expect(disk.readdirSync).toHaveBeenCalledTimes(1);
+		expect(disk.statSync).toHaveBeenCalledTimes(1);
+	});
+
+	it("answers for a missing Windows directory without a stat per name", () => {
+		const disk = winDisk({});
+		const probe = createExecutableProbe("win32", disk);
+		expect(probe.isExecutable("C:\\gone\\code.exe")).toBe(false);
+		expect(probe.isExecutable("C:\\gone\\code.cmd")).toBe(false);
+		expect(disk.readdirSync).toHaveBeenCalledTimes(1);
+		expect(disk.statSync).not.toHaveBeenCalled();
+	});
+
+	it("still finds a file in a Windows directory that cannot be listed", () => {
+		const disk = winDisk({ "C:\\locked": ["code.exe"] }, ["C:\\locked"]);
+		const probe = createExecutableProbe("win32", disk);
+		expect(probe.isExecutable("C:\\locked\\code.exe")).toBe(true);
+		expect(probe.isExecutable("C:\\locked\\zed.exe")).toBe(false);
+	});
+
+	it("sees a new install after the listing expires or is reset", () => {
+		const directories: Record<string, string[]> = { "C:\\bin": [] };
+		let now = 0;
+		const probe = createExecutableProbe("win32", winDisk(directories), () => now);
+		expect(probe.isExecutable("C:\\bin\\zed.exe")).toBe(false);
+		directories["C:\\bin"] = ["zed.exe"];
+		expect(probe.isExecutable("C:\\bin\\zed.exe")).toBe(false);
+		probe.reset();
+		expect(probe.isExecutable("C:\\bin\\zed.exe")).toBe(true);
+		directories["C:\\bin"] = ["zed.exe", "code.cmd"];
+		expect(probe.isExecutable("C:\\bin\\code.cmd")).toBe(false);
+		now = 30_000;
+		expect(probe.isExecutable("C:\\bin\\code.cmd")).toBe(true);
+	});
+
+	it("stats directly elsewhere and requires the execute bit", () => {
+		const readdirSync = vi.fn(() => []);
+		const statSync = vi.fn((candidatePath: string) => ({ isFile: () => true, mode: candidatePath === "/bin/code" ? 0o755 : 0o644 }));
+		const probe = createExecutableProbe("linux", { readdirSync, statSync });
+		expect(probe.isExecutable("/bin/code")).toBe(true);
+		expect(probe.isExecutable("/bin/readme")).toBe(false);
+		expect(readdirSync).not.toHaveBeenCalled();
 	});
 });
