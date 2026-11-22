@@ -392,6 +392,10 @@ export const SKILLS_REQUEST_TIMEOUT_MS = 10_000;
 export const EMPTY_SKILLS_GRACE_MS = 20_000;
 export const EMPTY_SKILLS_RECHECK_MS = 2_000;
 const NO_SKILLS: ChatSkill[] = [];
+// One empty list each, like NO_SKILLS: the chat keys memos, effects and a
+// context on these, so a fresh [] on every render reads as a change.
+const NO_LOCAL_ECHOS: ConversationLocalEcho[] = [];
+const NO_FILE_PATHS: string[] = [];
 
 /**
  * Answers that will never change on a retry. SESSION_MODE_MISMATCH is permanent
@@ -1600,7 +1604,7 @@ export function useConversationCommands(sessionId: string | undefined, hostId?: 
 		pendingAcceptedTurnId:
 			trackedDispatch?.state === "accepted" ? trackedDispatch.turnId : undefined,
 		acknowledgeAcceptedTurn,
-		localEchos: stateSessionId ? localEchosBySession[stateSessionId] ?? [] : [],
+		localEchos: stateSessionId ? localEchosBySession[stateSessionId] ?? NO_LOCAL_ECHOS : NO_LOCAL_ECHOS,
 		acknowledgeLocalEcho,
 		/** Shows a message at once while the agent switch it waits for runs. */
 		echoBeforeSend: (
@@ -2258,7 +2262,7 @@ export function useWorkspaceFilePaths(sessionId: string | undefined, enabled: bo
 		return subscribeWorkspaceFileChanges(sessionId, queryClient);
 	}, [enabled, hostId, queryClient, sessionId]);
 	return {
-		paths: query.data?.paths ?? [],
+		paths: query.data?.paths ?? NO_FILE_PATHS,
 		truncated: query.data?.truncated ?? false,
 		isLoading: query.isLoading,
 	};
