@@ -3,7 +3,7 @@ import path from "node:path";
 import os from "node:os";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
-import { createEditorHandoff, type EditorHandoffDeps } from "./editor-handoff";
+import { createEditorHandoff, INSTALLED_TARGETS_TTL_MS, type EditorHandoffDeps } from "./editor-handoff";
 
 function deps(overrides: Partial<EditorHandoffDeps> = {}): EditorHandoffDeps {
 	return {
@@ -18,6 +18,9 @@ function deps(overrides: Partial<EditorHandoffDeps> = {}): EditorHandoffDeps {
 		openDirectory: vi.fn().mockResolvedValue(undefined),
 		revealPath: vi.fn().mockResolvedValue(undefined),
 		realPath: vi.fn(async (candidatePath: string) => candidatePath),
+		// These fakes name executables by full path, so directories count as
+		// unlistable and each name is probed. listedMachine() supplies listings.
+		listDirectory: async () => undefined,
 		isExecutable: (candidatePath) => candidatePath === "/bin/code",
 		isDirectory: (candidatePath) => candidatePath === "/Applications/Cursor.app",
 		...overrides,
@@ -45,6 +48,23 @@ function installedExecutables(...expectedPaths: string[]) {
 	const expected = new Set(expectedPaths);
 	return (candidatePath: string) => expected.has(candidatePath);
 }
+
+/**
+ * A machine described by its directories: every name in one is an executable
+ * file. Directories named in `unlistable` can be searched but not read, like a
+ * folder with search permission only. Change `directories` to install or
+ * remove something.
+ */
+function listedMachine(platform: "win32" | "linux", directories: Record<string, string[]>, unlistable: string[] = []) {
+	const api = platform === "win32" ? path.win32 : path.posix;
+	const fold = (name: string) => (platform === "win32" ? name.toLowerCase() : name);
+	const listDirectory = vi.fn(async (directory: string) => (unlistable.includes(directory) ? undefined : [...(directories[directory] ?? [])]));
+	const isExecutable = vi.fn((candidatePath: string) =>
+		(directories[api.dirname(candidatePath)] ?? []).some((name) => fold(name) === fold(api.basename(candidatePath))));
+	return { directories, listDirectory, isExecutable };
+}
+
+const targetIds = (state: { targets: { id: string }[] }) => state.targets.map(({ id }) => id);
 
 describe("editor handoff", () => {
 	it("detects Dock-installed apps and keeps Finder and Terminal as safe fallbacks", async () => {
@@ -154,13 +174,13 @@ describe("editor handoff", () => {
 		expect(input.launch).toHaveBeenLastCalledWith("/bin/x-terminal-emulator", [], "/ao/data/artifacts/ao-1");
 	});
 
-	it("restores the generic Linux menu fallback when the named terminal is removed", async () => {
+	it("restores the generic Linux menu fallback on the next menu refresh after the named terminal is removed", async () => {
 		let installed = true;
 		const handoff = createEditorHandoff(deps({ platform: "linux", isDirectory: () => false,
 			isExecutable: (value) => value === "/bin/x-terminal-emulator" || (installed && value === "/bin/gnome-terminal") }));
 		expect((await handoff.getState("ao-1")).targets.filter((target) => target.kind === "terminal").map((target) => target.id)).toEqual(["gnome-terminal"]);
 		installed = false;
-		expect((await handoff.getState("ao-1")).targets.filter((target) => target.kind === "terminal").map((target) => target.id)).toEqual(["terminal"]);
+		expect((await handoff.getState("ao-1", { refreshTerminals: true })).targets.filter((target) => target.kind === "terminal").map((target) => target.id)).toEqual(["terminal"]);
 	});
 
 	it("discovers Windows Terminal from PATH", async () => {
@@ -782,17 +802,158 @@ describe("editor handoff (win32 fallback discovery)", () => {
 		expect(state.targets.some(({ id }) => id === "vscode")).toBe(true);
 	});
 
-	it("re-resolves editors installed after handoff creation instead of freezing at startup", async () => {
-		const installed = new Set<string>();
-		const input = winDeps({
-			isExecutable: (candidatePath) => installed.has(candidatePath),
-			isDirectory: () => false,
-		});
-		const handoff = createEditorHandoff(input);
-		expect((await handoff.getState("ao-1")).targets.some(({ id }) => id === "cursor")).toBe(false);
+	it("re-resolves editors installed after handoff creation once the cached list expires, instead of freezing at startup", async () => {
+		vi.useFakeTimers({ toFake: ["Date"] });
+		try {
+			const installed = new Set<string>();
+			const input = winDeps({
+				isExecutable: (candidatePath) => installed.has(candidatePath),
+				isDirectory: () => false,
+			});
+			const handoff = createEditorHandoff(input);
+			expect(targetIds(await handoff.getState("ao-1"))).not.toContain("cursor");
 
-		installed.add(cursorBin);
-		expect((await handoff.getState("ao-1")).targets.some(({ id }) => id === "cursor")).toBe(true);
+			installed.add(cursorBin);
+			// Until the list expires it comes from the cache, not the filesystem.
+			vi.setSystemTime(Date.now() + INSTALLED_TARGETS_TTL_MS - 1);
+			expect(targetIds(await handoff.getState("ao-1"))).not.toContain("cursor");
+			vi.setSystemTime(Date.now() + 1);
+			expect(targetIds(await handoff.getState("ao-1"))).toContain("cursor");
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+});
+
+describe("editor handoff (installed-target scan)", () => {
+	const winEnv = (PATH: string, PATHEXT = ".COM;.EXE;.BAT;.CMD") => ({ PATH, PATHEXT, ComSpec: "C:\\Windows\\System32\\cmd.exe" });
+	const opened = ["/worktrees/ao-1"];
+
+	it("reads each search directory once, however many sessions and session updates ask for state", async () => {
+		const machine = listedMachine("win32", { "C:\\tools": ["code.cmd"] });
+		// The same directory spelled three ways is one directory on Windows.
+		const handoff = createEditorHandoff(winDeps({ env: winEnv("C:\\tools;C:\\empty;c:\\TOOLS;C:\\tools\\"), ...machine }));
+		expect(targetIds(await handoff.getState("ao-1"))).toContain("vscode");
+		expect(machine.listDirectory.mock.calls.map(([directory]) => directory).sort()).toEqual(["C:\\empty", "C:\\tools"]);
+		const probes = machine.isExecutable.mock.calls.length;
+
+		// A send, the usage updates that follow it and a session switch all read state again.
+		for (let update = 0; update < 20; update += 1) {
+			expect(targetIds(await handoff.getState(`ao-${update % 3}`))).toContain("vscode");
+		}
+		expect(machine.listDirectory).toHaveBeenCalledTimes(2);
+		expect(machine.isExecutable).toHaveBeenCalledTimes(probes);
+	});
+
+	it("shares one scan between calls that arrive while it is running", async () => {
+		const machine = listedMachine("win32", { "C:\\tools": ["code.cmd"] });
+		const handoff = createEditorHandoff(winDeps({ env: winEnv("C:\\tools"), ...machine }));
+		const states = await Promise.all([handoff.getState("ao-1"), handoff.getState("ao-1"), handoff.getState("ao-2")]);
+		for (const state of states) expect(targetIds(state)).toContain("vscode");
+		expect(machine.listDirectory).toHaveBeenCalledTimes(1);
+	});
+
+	it("resolves a Windows command through PATHEXT, preferring a launcher shim and keeping the name on disk", async () => {
+		const machine = listedMachine("win32", { "C:\\tools": ["Code.CMD", "code", "WT.EXE", "notes.txt"] });
+		const input = winDeps({ env: winEnv("C:\\empty;C:\\tools"), ...machine });
+		const handoff = createEditorHandoff(input);
+		await handoff.open({ sessionId: "ao-1", targetId: "vscode" });
+		expect(input.launch).toHaveBeenLastCalledWith("C:\\tools\\Code.CMD", opened, "/worktrees/ao-1");
+		await handoff.open({ sessionId: "ao-1", targetId: "windows-terminal" });
+		expect(input.launch).toHaveBeenLastCalledWith("C:\\tools\\WT.EXE", ["-d", "/worktrees/ao-1"], "/worktrees/ao-1");
+		// Only names that are there get checked: no probe per candidate, extension and directory.
+		expect(new Set(machine.isExecutable.mock.calls.map(([candidatePath]) => candidatePath)))
+			.toEqual(new Set(["C:\\tools\\Code.CMD", "C:\\tools\\WT.EXE"]));
+	});
+
+	it("follows PATHEXT order and ignores extensions PATHEXT does not name", async () => {
+		const machine = listedMachine("win32", { "C:\\tools": ["code.cmd", "code.exe", "cursor.cmd"] });
+		const input = winDeps({ env: winEnv("C:\\tools", ".EXE;.CMD"), ...machine });
+		await createEditorHandoff(input).open({ sessionId: "ao-1", targetId: "vscode" });
+		expect(input.launch).toHaveBeenCalledWith("C:\\tools\\code.exe", opened, "/worktrees/ao-1");
+
+		const exeOnly = createEditorHandoff(winDeps({ env: winEnv("C:\\tools", ".EXE"), ...machine }));
+		expect(targetIds(await exeOnly.getState("ao-1"))).toEqual(["vscode", "file-manager", "terminal"]);
+	});
+
+	it("skips a missing directory and probes names in one it cannot list", async () => {
+		const machine = listedMachine("win32", { "C:\\locked": ["code.cmd"] }, ["C:\\locked"]);
+		const input = winDeps({ env: winEnv("C:\\missing;C:\\locked"), ...machine });
+		await createEditorHandoff(input).open({ sessionId: "ao-1", targetId: "vscode" });
+		expect(input.launch).toHaveBeenCalledWith("C:\\locked\\code.cmd", opened, "/worktrees/ao-1");
+		expect(machine.isExecutable.mock.calls.every(([candidatePath]) => candidatePath.startsWith("C:\\locked\\"))).toBe(true);
+	});
+
+	it("matches names exactly on Linux", async () => {
+		const machine = listedMachine("linux", { "/opt/bin": ["Code", "kitty"] });
+		const handoff = createEditorHandoff(deps({ platform: "linux", env: { PATH: "/opt/bin" }, isDirectory: () => false, ...machine }));
+		expect(targetIds(await handoff.getState("ao-1"))).toEqual(["file-manager", "kitty"]);
+	});
+
+	it("rescans at once when a menu asks for a refresh, and keeps that result for later reads", async () => {
+		const machine = listedMachine("win32", { "C:\\tools": [] });
+		const handoff = createEditorHandoff(winDeps({ env: winEnv("C:\\tools"), ...machine }));
+		expect(targetIds(await handoff.getState("ao-1"))).not.toContain("vscode");
+
+		machine.directories["C:\\tools"] = ["code.cmd"];
+		expect(targetIds(await handoff.getState("ao-1"))).not.toContain("vscode");
+		expect(targetIds(await handoff.getState("ao-1", { refreshTerminals: true }))).toContain("vscode");
+		expect(targetIds(await handoff.getState("ao-2"))).toContain("vscode");
+	});
+
+	it("lists a newly installed editor in Settings without waiting for the cached list to expire", async () => {
+		const machine = listedMachine("win32", { "C:\\tools": [] });
+		const input = winDeps({ env: winEnv("C:\\tools"), ...machine });
+		const handoff = createEditorHandoff(input);
+		expect((await handoff.getEditors()).editors).toEqual([]);
+
+		machine.directories["C:\\tools"] = ["code.cmd"];
+		expect((await handoff.getEditors()).editors).toEqual([{ id: "vscode", name: "VS Code", kind: "editor" }]);
+		await expect(handoff.setPreferredEditor("vscode")).resolves.toBe("vscode");
+	});
+
+	it("checks the filesystem again before every launch", async () => {
+		const machine = listedMachine("win32", { "C:\\tools": [] });
+		const input = winDeps({ env: winEnv("C:\\tools"), ...machine, resolveWorkspace: vi.fn().mockResolvedValue("C:\\worktrees\\ao-1") });
+		const handoff = createEditorHandoff(input);
+		expect(targetIds(await handoff.getState("ao-1"))).not.toContain("vscode");
+
+		// Installed since the cached scan: both launch paths find it.
+		machine.directories["C:\\tools"] = ["code.cmd"];
+		await handoff.open({ sessionId: "ao-1", targetId: "vscode" });
+		expect(input.launch).toHaveBeenLastCalledWith("C:\\tools\\code.cmd", ["C:\\worktrees\\ao-1"], "C:\\worktrees\\ao-1");
+		await handoff.pathAction({ sessionId: "ao-1", path: "src/a.ts", action: "open", editorId: "vscode" });
+		expect(input.launch).toHaveBeenLastCalledWith("C:\\tools\\code.cmd", ["--new-window", "C:\\worktrees\\ao-1\\src\\a.ts"], "C:\\worktrees\\ao-1\\src");
+
+		// Removed since: nothing is launched from the cached entry.
+		machine.directories["C:\\tools"] = [];
+		await expect(handoff.open({ sessionId: "ao-1", targetId: "vscode" })).rejects.toThrow("not installed");
+		await expect(handoff.pathAction({ sessionId: "ao-1", path: "src/a.ts", action: "open", editorId: "vscode" })).rejects.toThrow("not installed");
+		expect(input.launch).toHaveBeenCalledTimes(2);
+	});
+
+	it("finds a command through the real filesystem, past a missing directory and a folder with the command's name", async () => {
+		const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "ao-editor-scan-")));
+		try {
+			const name = process.platform === "win32" ? "code.cmd" : "code";
+			const decoy = path.join(root, "decoy");
+			const bin = path.join(root, "bin");
+			await mkdir(path.join(decoy, name), { recursive: true });
+			await mkdir(bin);
+			await writeFile(path.join(bin, name), process.platform === "win32" ? "@echo off\r\n" : "#!/bin/sh\n", { mode: 0o755 });
+			const input = deps({
+				platform: process.platform,
+				env: { PATH: [path.join(root, "missing"), decoy, bin].join(path.delimiter), PATHEXT: ".CMD" },
+				homeDir: root,
+				listDirectory: undefined,
+				isExecutable: undefined,
+				isDirectory: undefined,
+			});
+			await createEditorHandoff(input).open({ sessionId: "ao-1", targetId: "vscode" });
+			expect(input.launch).toHaveBeenCalledWith(path.join(bin, name), opened, "/worktrees/ao-1");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 });
 

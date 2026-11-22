@@ -14,6 +14,7 @@ import {
 import { sessionReviewsQueryKey } from "./session-reviews";
 import { sessionUsageQueryRoot } from "../hooks/useSessionUsageSummaries";
 import { editorHandoffQueryKey, editorHandoffQueryRoot } from "../hooks/useEditorHandoff";
+import type { EditorHandoffState } from "../../shared/editor-handoff";
 import { shellTerminalsQueryKey, shellTerminalsQueryKeyForHost } from "../hooks/useShellTerminals";
 import { baseUrlForHost, connectedHosts, subscribeConnectedHosts } from "./host-clients";
 import { probeRemoteSse } from "./remote-sse-probe";
@@ -57,8 +58,9 @@ const CDC_EVENT_TYPES = [
  *   - daemon lifecycle over Electron IPC (coming up/down changes session availability)
  *   - each connected daemon's CDC stream over SSE (project/session/PR changes)
  *   - the Codex account stream over SSE (account, capacity, and switch state)
- * Lifecycle and CDC events invalidate the owning host's cache; durable per-session
- * updates also refresh editor-handoff readiness. Invalidations are batched
+ * Lifecycle and CDC events invalidate the owning host's cache; per-session
+ * updates also refresh editor-handoff readiness while a session's workspace is
+ * not known to exist or the session is terminated. Invalidations are batched
  * because a single user action can emit a burst of CDC events.
  */
 export function createEventTransport(queryClient: QueryClient): EventTransport {
@@ -71,6 +73,9 @@ export function createEventTransport(queryClient: QueryClient): EventTransport {
 			const pendingReviewSessions = new Set<string>();
 			const pendingInterfaceTransitionSessions = new Set<string>();
 			const pendingEditorHandoffSessions = new Set<string>();
+			// Sessions the stream last reported as terminated. Their worktree can be
+			// removed at any point, and cleanup reports in with id-only updates.
+			const terminatedSessions = new Set<string>();
 			const pendingModelCatalogScopes = new Map<string, { agentId: string; projectId: string }>();
 			let workspaceInvalidationPending = false;
 			let allConversationsInvalidationPending = false;
@@ -443,6 +448,7 @@ export function createEventTransport(queryClient: QueryClient): EventTransport {
 										reviewId?: unknown;
 										interfaceTransitionId?: unknown;
 										activity?: unknown;
+										isTerminated?: unknown;
 										shellTerminalHandleId?: unknown;
 										kind?: unknown;
 										agentId?: unknown;
@@ -523,7 +529,18 @@ export function createEventTransport(queryClient: QueryClient): EventTransport {
 							if (typeof payload?.activity === "string") {
 								pendingInterfaceTransitionSessions.add(decoded.sessionId);
 							}
-							pendingEditorHandoffSessions.add(decoded.sessionId);
+							if (payload?.isTerminated === true) terminatedSessions.add(decoded.sessionId);
+							else if (payload?.isTerminated === false) terminatedSessions.delete(decoded.sessionId);
+							// Editor-handoff state is the installed editors and terminals plus
+							// whether the workspace folder exists. Neither changes when a turn
+							// starts, ends or bills, and every refetch is a round trip to the
+							// main process, so a session whose workspace is known to exist
+							// rechecks only while terminated. A new session still waiting for
+							// its workspace refetches on each update, as it becomes ready.
+							const handoff = queryClient.getQueryData<EditorHandoffState>(editorHandoffQueryKey(decoded.sessionId));
+							if (handoff?.workspaceAvailable !== true || terminatedSessions.has(decoded.sessionId)) {
+								pendingEditorHandoffSessions.add(decoded.sessionId);
+							}
 						}
 					} catch {
 						// A malformed CDC payload still invalidates workspaces; it simply
@@ -654,6 +671,8 @@ export function createEventTransport(queryClient: QueryClient): EventTransport {
 				pendingConversationSessions.clear();
 				pendingReviewSessions.clear();
 				pendingInterfaceTransitionSessions.clear();
+				pendingEditorHandoffSessions.clear();
+				terminatedSessions.clear();
 				pendingModelCatalogScopes.clear();
 				refreshes.clear();
 				if (retryTimer) clearTimeout(retryTimer);
