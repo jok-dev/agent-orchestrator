@@ -723,6 +723,74 @@ describe("createEventTransport", () => {
 		}
 	});
 
+	// An open session keeps its editor-handoff query mounted, and each fetch is a
+	// round trip to the main process. Which editors are installed and whether the
+	// workspace folder exists do not change when a turn starts, ends or bills.
+	describe("editor-handoff for a session whose workspace is available", () => {
+		const sessionId = "session-1";
+		const queryKey = ["editor-handoff", sessionId] as const;
+		const sessionUpdated = (payload: Record<string, unknown>) =>
+			cdcSources()[0].emit("session_updated", JSON.stringify({
+				seq: 1, projectId: "proj-1", sessionId, type: "session_updated", payload, createdAt: "2026-11-21T10:00:00Z",
+			}));
+		/** A mounted query holding `workspaceAvailable: true`, with the transport connected. */
+		async function mountAvailable() {
+			const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+			const queryFn = vi.fn().mockResolvedValue({ workspaceAvailable: true });
+			await queryClient.fetchQuery({ queryKey, queryFn, staleTime: 10_000 });
+			const unsubscribe = new QueryObserver(queryClient, { queryKey, queryFn, staleTime: 10_000 }).subscribe(() => {});
+			const disconnect = createEventTransport(queryClient).connect();
+			return { queryFn, stop: () => { unsubscribe(); disconnect(); } };
+		}
+
+		it("does not refetch it for the session updates a send produces", async () => {
+			vi.useFakeTimers();
+			let stop: (() => void) | undefined;
+			try {
+				const mounted = await mountAvailable();
+				stop = mounted.stop;
+				// One send: the session goes active, usage is recorded, the turn ends.
+				sessionUpdated({ id: sessionId, activity: "active", isTerminated: false, provisionState: "ready" });
+				sessionUpdated({ id: sessionId });
+				await vi.advanceTimersByTimeAsync(200);
+				sessionUpdated({ sessionId });
+				sessionUpdated({ id: sessionId, activity: "idle", isTerminated: false, provisionState: "ready" });
+				await vi.advanceTimersByTimeAsync(6_000);
+
+				expect(mounted.queryFn).toHaveBeenCalledTimes(1);
+			} finally {
+				stop?.();
+				vi.useRealTimers();
+			}
+		});
+
+		it("rechecks it when the session terminates and as its worktree cleanup reports in", async () => {
+			vi.useFakeTimers();
+			let stop: (() => void) | undefined;
+			try {
+				const mounted = await mountAvailable();
+				stop = mounted.stop;
+				sessionUpdated({ id: sessionId, activity: "exited", isTerminated: true });
+				await vi.advanceTimersByTimeAsync(200);
+				expect(mounted.queryFn).toHaveBeenCalledTimes(2);
+
+				// Cleanup facts arrive as id-only updates once the worktree is removed.
+				sessionUpdated({ id: sessionId });
+				await vi.advanceTimersByTimeAsync(200);
+				expect(mounted.queryFn).toHaveBeenCalledTimes(3);
+
+				// Restored with its workspace back: activity is quiet again.
+				sessionUpdated({ id: sessionId, activity: "active", isTerminated: false });
+				sessionUpdated({ id: sessionId });
+				await vi.advanceTimersByTimeAsync(200);
+				expect(mounted.queryFn).toHaveBeenCalledTimes(3);
+			} finally {
+				stop?.();
+				vi.useRealTimers();
+			}
+		});
+	});
+
 	it("refreshes spent switch readiness on session-row CDC without resuming unbounded polling", async () => {
 		vi.useFakeTimers();
 		const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false, refetchOnWindowFocus: false } } });

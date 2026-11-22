@@ -1,6 +1,7 @@
 import { terminalCommand, LINUX_TERMINAL_LAUNCHERS } from "./terminal-command";
 import { createHash } from "node:crypto";
-import { closeSync, constants, openSync, readSync, statSync } from "node:fs";
+import { constants } from "node:fs";
+import { open, readdir, stat, type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import {
 	isEditorId,
@@ -108,10 +109,15 @@ export type EditorHandoffDeps = {
 	readIcon?: (appPath: string) => Promise<string>;
 	/** Registered macOS shell apps that accept folder-open events. */
 	discoverTerminalApps?: () => Promise<MacTerminalApp[]>;
-	isExecutable?: (candidatePath: string) => boolean;
-	isDirectory?: (candidatePath: string) => boolean;
+	/**
+	 * The names in a directory. An empty list means nothing can be found there;
+	 * undefined means it could not be read but may still hold a named file.
+	 */
+	listDirectory?: (directory: string) => Promise<string[] | undefined>;
+	isExecutable?: (candidatePath: string) => boolean | Promise<boolean>;
+	isDirectory?: (candidatePath: string) => boolean | Promise<boolean>;
 	/** Reads the first bytes of a file as text, or undefined when unreadable. */
-	readFileHead?: (candidatePath: string) => string | undefined;
+	readFileHead?: (candidatePath: string) => string | undefined | Promise<string | undefined>;
 	logError?: (message: string, error: unknown) => void;
 };
 
@@ -126,41 +132,106 @@ export type EditorHandoff = {
 	copyWorkspacePath(sessionId: string): Promise<void>;
 };
 
-function defaultIsExecutable(candidatePath: string, platform: Platform): boolean {
+// Every filesystem lookup here is asynchronous: this runs in Electron's main
+// process, where a synchronous scan of the search path freezes the window.
+async function defaultIsExecutable(candidatePath: string, platform: Platform): Promise<boolean> {
 	try {
-		const stat = statSync(candidatePath);
-		return stat.isFile() && (platform === "win32" || (stat.mode & constants.X_OK) !== 0);
+		const info = await stat(candidatePath);
+		return info.isFile() && (platform === "win32" || (info.mode & constants.X_OK) !== 0);
 	} catch {
 		return false;
 	}
 }
 
-function defaultReadFileHead(candidatePath: string): string | undefined {
-	let fd: number | undefined;
+async function defaultReadFileHead(candidatePath: string): Promise<string | undefined> {
+	let handle: FileHandle | undefined;
 	try {
-		fd = openSync(candidatePath, "r");
+		handle = await open(candidatePath, "r");
 		const buffer = Buffer.alloc(4096);
-		return buffer.toString("utf8", 0, readSync(fd, buffer, 0, buffer.length, 0));
+		const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+		return buffer.toString("utf8", 0, bytesRead);
 	} catch {
 		return undefined;
 	} finally {
-		if (fd !== undefined) closeSync(fd);
+		await handle?.close().catch(() => undefined);
 	}
 }
 
 // The Cursor Agent CLI installer puts a `cursor` shim in ~/.local/bin. Without
 // the Cursor IDE it only runs `cursor agent` and exits 1 for anything else, so
 // it must not count as an installed editor.
-function isCursorAgentShim(candidatePath: string, readFileHead: (candidatePath: string) => string | undefined): boolean {
-	return readFileHead(candidatePath)?.includes("No Cursor IDE installation found") === true;
+function isCursorAgentShim(fileHead: string | undefined): boolean {
+	return fileHead?.includes("No Cursor IDE installation found") === true;
 }
 
-function defaultIsDirectory(candidatePath: string): boolean {
+async function defaultIsDirectory(candidatePath: string): Promise<boolean> {
 	try {
-		return statSync(candidatePath).isDirectory();
+		return (await stat(candidatePath)).isDirectory();
 	} catch {
 		return false;
 	}
+}
+
+// A directory that exists but cannot be read (search permission only) can still
+// hold a command, so it reports undefined and is probed by name. Any other
+// failure, a missing directory above all, leaves nothing to find.
+async function defaultListDirectory(directory: string): Promise<string[] | undefined> {
+	try {
+		return await readdir(directory);
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		return code === "EACCES" || code === "EPERM" ? undefined : [];
+	}
+}
+
+type Probes = {
+	isExecutable: (candidatePath: string) => Promise<boolean>;
+	isDirectory: (candidatePath: string) => Promise<boolean>;
+	readFileHead: (candidatePath: string) => Promise<string | undefined>;
+};
+
+/**
+ * The filesystem as one scan for installed targets sees it. Each search
+ * directory is read once and every candidate name is matched against that
+ * listing in memory, so a scan costs one read per directory instead of one
+ * stat per candidate, per extension, per directory.
+ */
+type TargetScan = Probes & {
+	/** Where commands are looked up, in order, each directory once. */
+	searchDirs: string[];
+	/**
+	 * How a listed name matches a command: case-insensitively on Windows, where
+	 * PATHEXT and files on disk spell extensions in either case, exactly elsewhere.
+	 */
+	nameKey: (name: string) => string;
+	/** A directory's names by nameKey, read at most once; undefined when it cannot be listed. */
+	entries: (directory: string) => Promise<Map<string, string> | undefined>;
+};
+
+function createTargetScan(deps: EditorHandoffDeps, probes: Probes): TargetScan {
+	const listDirectory = deps.listDirectory ?? defaultListDirectory;
+	const nameKey = (name: string) => (deps.platform === "win32" ? name.toLowerCase() : name);
+	const listings = new Map<string, Promise<Map<string, string> | undefined>>();
+	return {
+		...probes,
+		searchDirs: commandSearchDirs(deps.platform, deps.env),
+		nameKey,
+		entries(directory) {
+			let listing = listings.get(directory);
+			if (!listing) {
+				listing = listDirectory(directory).then((names) => names && new Map(names.map((name) => [nameKey(name), name])));
+				listings.set(directory, listing);
+			}
+			return listing;
+		},
+	};
+}
+
+async function firstMatching<T>(values: readonly T[], matches: (value: T) => Promise<boolean>): Promise<T | undefined> {
+	for (const value of values) {
+		if (await matches(value)) return value;
+	}
+	return undefined;
 }
 
 function pathAPI(platform: Platform) {
@@ -210,29 +281,58 @@ function executableNames(command: string, platform: Platform, env: NodeJS.Proces
 
 function commandSearchDirs(platform: Platform, env: NodeJS.ProcessEnv): string[] {
 	const fromPath = (env.PATH || "").split(pathAPI(platform).delimiter).filter(Boolean);
-	if (platform === "darwin") return [...fromPath, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"];
-	if (platform === "linux") return [...fromPath, "/usr/local/bin", "/usr/bin"];
-	return fromPath;
+	const dirs = platform === "darwin" ? [...fromPath, "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"]
+		: platform === "linux" ? [...fromPath, "/usr/local/bin", "/usr/bin"]
+			: fromPath;
+	// PATH often repeats a directory, with or without a trailing separator and,
+	// on Windows, in any case. The first mention decides its place; later ones
+	// add nothing.
+	const seen = new Set<string>();
+	return dirs.filter((directory) => {
+		const normalized = pathAPI(platform).normalize(directory).replace(/(?<=.)[\\/]+$/, "");
+		const key = platform === "win32" ? normalized.toLowerCase() : normalized;
+		if (seen.has(key)) return false;
+		seen.add(key);
+		return true;
+	});
 }
 
-function resolveOnPath(
+// The first directory holding the command wins, and within it the first name
+// in executableNames order: PATHEXT's order on Windows, then the bare name.
+async function findCommand(
 	command: string,
-	platform: Platform,
-	env: NodeJS.ProcessEnv,
-	isExecutable: (candidatePath: string) => boolean,
-	skip?: (candidatePath: string) => boolean,
-): string | undefined {
-	for (const directory of commandSearchDirs(platform, env)) {
-		for (const name of executableNames(command, platform, env)) {
-			const candidatePath = pathAPI(platform).join(directory, name);
-			if (isExecutable(candidatePath) && !skip?.(candidatePath)) return candidatePath;
+	directories: readonly string[],
+	deps: EditorHandoffDeps,
+	scan: TargetScan,
+	skip?: (candidatePath: string) => Promise<boolean>,
+): Promise<string | undefined> {
+	// On Windows the upper- and lower-case PATHEXT spellings are one name.
+	const keys = [...new Set(executableNames(command, deps.platform, deps.env).map(scan.nameKey))];
+	for (const directory of directories) {
+		const entries = await scan.entries(directory);
+		// A listing answers for every candidate name at once, in the spelling on
+		// disk. A directory that cannot be listed is probed one name at a time.
+		const present = entries ? keys.flatMap((key) => entries.get(key) ?? []) : keys;
+		for (const name of present) {
+			const candidatePath = pathAPI(deps.platform).join(directory, name);
+			if ((await scan.isExecutable(candidatePath)) && !(await skip?.(candidatePath))) return candidatePath;
 		}
 	}
 	return undefined;
 }
 
-function resolveTerminalEditor(editorCommand: string, deps: EditorHandoffDeps, isExecutable: (candidatePath: string) => boolean): ResolvedCommand | undefined {
-	const resolve = (target: string) => terminalCommand([editorCommand, target], deps.platform, deps.env, isExecutable);
+// Linux has no single terminal: these are the launchers found on the search
+// path, in preference order. Other platforms use a fixed system terminal.
+async function resolveTerminalLaunchers(deps: EditorHandoffDeps, scan: TargetScan): Promise<string[]> {
+	if (deps.platform === "darwin" || deps.platform === "win32") return [];
+	const found = await Promise.all(LINUX_TERMINAL_LAUNCHERS.map((launcher) => findCommand(launcher.command, scan.searchDirs, deps, scan)));
+	return found.filter((command): command is string => command !== undefined);
+}
+
+function resolveTerminalEditor(editorCommand: string, deps: EditorHandoffDeps, terminalLaunchers: readonly string[]): ResolvedCommand | undefined {
+	// The scan already found the launchers, so building a command line at launch
+	// needs no filesystem access.
+	const resolve = (target: string) => terminalCommand([editorCommand, target], deps.platform, deps.env, (candidatePath) => terminalLaunchers.includes(candidatePath));
 	const spec = resolve(".");
 	return spec
 		? {
@@ -262,41 +362,25 @@ function winInstallDirsFor(candidate: EditorCandidate, env: NodeJS.ProcessEnv): 
 	return dirs;
 }
 
-function resolveInDirs(
-	command: string,
-	platform: Platform,
-	env: NodeJS.ProcessEnv,
-	dirs: readonly string[],
-	isExecutable: (candidatePath: string) => boolean,
-): string | undefined {
-	for (const directory of dirs) {
-		for (const name of executableNames(command, platform, env)) {
-			const candidatePath = pathAPI(platform).join(directory, name);
-			if (isExecutable(candidatePath)) return candidatePath;
-		}
-	}
-	return undefined;
-}
-
-function resolveEditor(
+async function resolveEditor(
 	candidate: EditorCandidate,
 	deps: EditorHandoffDeps,
-	isExecutable: (candidatePath: string) => boolean,
-	isDirectory: (candidatePath: string) => boolean,
-	readFileHead: (candidatePath: string) => string | undefined,
-): ResolvedCommand | undefined {
+	scan: TargetScan,
+	terminalLaunchers: readonly string[],
+): Promise<ResolvedCommand | undefined> {
 	for (const command of candidate.commands) {
 		// Keep scanning PATH past the agent shim: a real Cursor CLI may follow it.
-		const skip = candidate.id === "cursor" ? (candidatePath: string) => isCursorAgentShim(candidatePath, readFileHead) : undefined;
-		const resolved = resolveOnPath(command, deps.platform, deps.env, isExecutable, skip);
+		const skip = candidate.id === "cursor"
+			? async (candidatePath: string) => isCursorAgentShim(await scan.readFileHead(candidatePath)) : undefined;
+		const resolved = await findCommand(command, scan.searchDirs, deps, scan, skip);
 		if (resolved) {
 			if (candidate.requiresTerminal) {
-				const terminal = resolveTerminalEditor(resolved, deps, isExecutable);
+				const terminal = resolveTerminalEditor(resolved, deps, terminalLaunchers);
 				return terminal ? { ...terminal, iconPath: resolved } : undefined;
 			}
-			const appPath = deps.platform === "darwin" ? (candidate.macApps ?? []).flatMap((name) =>
+			const appPath = deps.platform === "darwin" ? await firstMatching((candidate.macApps ?? []).flatMap((name) =>
 				["/Applications", path.posix.join(deps.homeDir, "Applications")].map((root) => path.posix.join(root, `${name}.app`)),
-			).find(isDirectory) : undefined;
+			), scan.isDirectory) : undefined;
 			return {
 				command: resolved,
 				iconPath: appPath ?? resolved,
@@ -311,7 +395,7 @@ function resolveEditor(
 	if (deps.platform === "win32") {
 		const installDirs = winInstallDirsFor(candidate, deps.env);
 		for (const command of candidate.commands) {
-			const resolved = resolveInDirs(command, deps.platform, deps.env, installDirs, isExecutable);
+			const resolved = await findCommand(command, installDirs, deps, scan);
 			if (resolved) return {
 				command: resolved, iconPath: resolved,
 				argsForFile: (filePath) => [...(candidate.fileArgs ?? []), filePath],
@@ -322,7 +406,7 @@ function resolveEditor(
 	if (deps.platform !== "darwin") return undefined;
 	for (const appName of candidate.macApps ?? []) {
 		for (const root of ["/Applications", path.posix.join(deps.homeDir, "Applications")]) {
-			if (isDirectory(path.posix.join(root, `${appName}.app`))) {
+			if (await scan.isDirectory(path.posix.join(root, `${appName}.app`))) {
 				return {
 					command: "/usr/bin/open",
 					iconPath: path.posix.join(root, `${appName}.app`),
@@ -337,10 +421,9 @@ function resolveEditor(
 	return undefined;
 }
 
-function resolveTerminal(
-	deps: EditorHandoffDeps,
-	isExecutable: (candidatePath: string) => boolean,
-): { target: OpenTarget; command: ResolvedCommand } | undefined {
+type ResolvedTarget = { target: OpenTarget; command: ResolvedCommand };
+
+function resolveTerminal(deps: EditorHandoffDeps, terminalLaunchers: readonly string[]): ResolvedTarget | undefined {
 	if (deps.platform === "darwin") {
 		return {
 			target: { id: "terminal", name: "Terminal", kind: "terminal" },
@@ -360,16 +443,11 @@ function resolveTerminal(
 			},
 		};
 	}
-	for (const launcher of LINUX_TERMINAL_LAUNCHERS) {
-		const resolved = resolveOnPath(launcher.command, deps.platform, deps.env, isExecutable);
-		if (resolved) {
-			return {
-				target: { id: "terminal", name: "Terminal", kind: "terminal" },
-				command: { command: resolved, argsForWorkspace: () => [] },
-			};
-		}
-	}
-	return undefined;
+	const [launcher] = terminalLaunchers;
+	return launcher ? {
+		target: { id: "terminal", name: "Terminal", kind: "terminal" },
+		command: { command: launcher, argsForWorkspace: () => [] },
+	} : undefined;
 }
 
 // Keep per-terminal directory arguments explicit: a GUI terminal may reuse an
@@ -393,29 +471,25 @@ const TERMINAL_CANDIDATES: {
 	{ id: "windows-terminal", name: "Windows Terminal", command: "wt", platforms: ["win32"], args: (dir) => ["-d", dir] },
 ];
 
-function resolveInstalledTerminals(
-	deps: EditorHandoffDeps,
-	isExecutable: (candidatePath: string) => boolean,
-	isDirectory: (candidatePath: string) => boolean,
-	macApps: MacTerminalApp[],
-): { target: OpenTarget; command: ResolvedCommand }[] {
+async function resolveInstalledTerminals(deps: EditorHandoffDeps, scan: TargetScan, macApps: MacTerminalApp[]): Promise<ResolvedTarget[]> {
 	const claimedApps = new Set<string>();
-	const known = TERMINAL_CANDIDATES.flatMap((candidate) => {
-		if (!candidate.platforms.includes(deps.platform)) return [];
+	const known: ResolvedTarget[] = [];
+	// One at a time and in order: each candidate claims apps the next must skip.
+	for (const candidate of TERMINAL_CANDIDATES) {
+		if (!candidate.platforms.includes(deps.platform)) continue;
 		const target: OpenTarget = { id: candidate.id, name: candidate.name, kind: "terminal" };
 		if (deps.platform === "darwin" && candidate.macApp) {
 			const registered = macApps.filter((app) => path.posix.basename(app.appPath) === `${candidate.macApp}.app`);
-			const appPaths = [
+			const appPath = await firstMatching([
 				...registered.map((app) => app.appPath),
 				...["/Applications", path.posix.join(deps.homeDir, "Applications")].map((root) => path.posix.join(root, `${candidate.macApp}.app`)),
-			];
-			for (const appPath of appPaths) {
-				if (!isDirectory(appPath)) continue;
+			], scan.isDirectory);
+			if (appPath) {
 				for (const app of registered) claimedApps.add(app.appPath);
 				claimedApps.add(appPath);
 				const iconDataUrl = registered.find((app) => app.appPath === appPath)?.iconDataUrl;
 				if (iconDataUrl) target.iconDataUrl = iconDataUrl;
-				return [{ target, command: {
+				known.push({ target, command: {
 					command: "/usr/bin/open",
 					iconPath: appPath,
 					// Ghostty and iTerm set the surface directory from folder-open
@@ -423,34 +497,48 @@ function resolveInstalledTerminals(
 					argsForWorkspace: (dir: string) => candidate.id === "iterm2" || candidate.id === "ghostty"
 						? ["-a", appPath, dir]
 						: ["-n", "-a", appPath, "--args", ...candidate.args(dir)],
-				} }];
+				} });
+				continue;
 			}
 			// Ghostty's native macOS app must launch through Launch Services.
-			if (candidate.id === "ghostty" || candidate.id === "iterm2") return [];
+			if (candidate.id === "ghostty" || candidate.id === "iterm2") continue;
 		}
-		const command = candidate.command && resolveOnPath(candidate.command, deps.platform, deps.env, isExecutable);
-		return command ? [{ target, command: { command, argsForWorkspace: candidate.args } }] : [];
-	});
+		const command = candidate.command && await findCommand(candidate.command, scan.searchDirs, deps, scan);
+		if (command) known.push({ target, command: { command, argsForWorkspace: candidate.args } });
+	}
 	const claimedBundleIds = new Set(["com.apple.terminal"]);
-	const discovered = macApps.flatMap((app) => {
-		if (claimedBundleIds.has(app.bundleId.toLowerCase()) || claimedApps.has(app.appPath) || !isDirectory(app.appPath)) return [];
+	const discovered: ResolvedTarget[] = [];
+	for (const app of macApps) {
+		if (claimedBundleIds.has(app.bundleId.toLowerCase()) || claimedApps.has(app.appPath) || !(await scan.isDirectory(app.appPath))) continue;
 		claimedApps.add(app.appPath);
 		claimedBundleIds.add(app.bundleId.toLowerCase());
 		// An opaque stable ID crosses IPC; installation paths remain in main.
 		const id: TerminalId = `terminal-app:${createHash("sha256").update(app.bundleId.toLowerCase()).digest("hex")}`;
-		return [{ target: { id, name: app.name, kind: "terminal" as const, ...(app.iconDataUrl ? { iconDataUrl: app.iconDataUrl } : {}) }, command: {
+		discovered.push({ target: { id, name: app.name, kind: "terminal", ...(app.iconDataUrl ? { iconDataUrl: app.iconDataUrl } : {}) }, command: {
 			command: "/usr/bin/open",
 			iconPath: app.appPath,
 			argsForWorkspace: (dir: string) => ["-a", app.appPath, dir],
-		} }];
-	});
+		} });
+	}
 	return [...known, ...discovered.sort((a, b) => a.target.name.localeCompare(b.target.name))];
 }
 
+// Which editors and terminals are installed is the same for every session and
+// rarely changes, while finding out means reading every directory on the search
+// path. Readiness polling, session events and switching sessions therefore
+// share one scan for this long. A menu refresh, the Settings list and every
+// launch scan again, so a new install shows up when someone looks for it and a
+// removed target is never launched from memory.
+export const INSTALLED_TARGETS_TTL_MS = 30_000;
+
+type InstalledTargets = { editors: ResolvedTarget[]; terminals: ResolvedTarget[] };
+
 export function createEditorHandoff(deps: EditorHandoffDeps): EditorHandoff {
-	const isExecutable = deps.isExecutable ?? ((candidatePath) => defaultIsExecutable(candidatePath, deps.platform));
-	const isDirectory = deps.isDirectory ?? defaultIsDirectory;
-	const readFileHead = deps.readFileHead ?? defaultReadFileHead;
+	const probes: Probes = {
+		isExecutable: async (candidatePath) => (deps.isExecutable ? deps.isExecutable(candidatePath) : defaultIsExecutable(candidatePath, deps.platform)),
+		isDirectory: async (candidatePath) => (deps.isDirectory ?? defaultIsDirectory)(candidatePath),
+		readFileHead: async (candidatePath) => (deps.readFileHead ?? defaultReadFileHead)(candidatePath),
+	};
 	const fileManager: OpenTarget = {
 		id: "file-manager",
 		name: deps.platform === "darwin" ? "Finder" : deps.platform === "win32" ? "File Explorer" : "File Manager",
@@ -477,7 +565,7 @@ export function createEditorHandoff(deps: EditorHandoffDeps): EditorHandoff {
 
 	// Only an explicit menu refresh queries Launch Services and renders bundle
 	// icons. Readiness polling, CDC invalidations, and launches use this shared
-	// main-process snapshot; file existence is still checked at resolution time.
+	// main-process snapshot; file existence is still checked by each scan.
 	let macApps: MacTerminalApp[] = [];
 	let terminalRefresh: Promise<void> | undefined;
 	const refreshTerminals = () => {
@@ -489,13 +577,32 @@ export function createEditorHandoff(deps: EditorHandoffDeps): EditorHandoff {
 		}
 		return terminalRefresh;
 	};
-	const resolveEditors = () => EDITOR_CANDIDATES.flatMap((candidate) => {
-		const command = resolveEditor(candidate, deps, isExecutable, isDirectory, readFileHead);
-		return command ? [{ target: { id: candidate.id, name: candidate.name, kind: "editor" } as OpenTarget, command }] : [];
-	});
-	const resolveTerminals = () => {
-		const terminal = resolveTerminal(deps, isExecutable);
-		return [...(terminal ? [terminal] : []), ...resolveInstalledTerminals(deps, isExecutable, isDirectory, macApps)];
+	const scanInstalledTargets = async (): Promise<InstalledTargets> => {
+		const scan = createTargetScan(deps, probes);
+		const terminalLaunchers = await resolveTerminalLaunchers(deps, scan);
+		const [editors, installedTerminals] = await Promise.all([
+			Promise.all(EDITOR_CANDIDATES.map(async (candidate): Promise<ResolvedTarget[]> => {
+				const command = await resolveEditor(candidate, deps, scan, terminalLaunchers);
+				return command ? [{ target: { id: candidate.id, name: candidate.name, kind: "editor" }, command }] : [];
+			})),
+			resolveInstalledTerminals(deps, scan, macApps),
+		]);
+		const terminal = resolveTerminal(deps, terminalLaunchers);
+		return { editors: editors.flat(), terminals: [...(terminal ? [terminal] : []), ...installedTerminals] };
+	};
+	let cached: { targets: Promise<InstalledTargets>; scannedAt: number } | undefined;
+	// The cache holds the scan's promise, so calls that arrive while it runs share it.
+	const installedTargets = (fresh = false): Promise<InstalledTargets> => {
+		// A negative age means the clock went back: scan again instead of trusting it.
+		const age = cached ? Date.now() - cached.scannedAt : -1;
+		if (!fresh && cached && age >= 0 && age < INSTALLED_TARGETS_TTL_MS) return cached.targets;
+		const entry = { targets: scanInstalledTargets(), scannedAt: Date.now() };
+		cached = entry;
+		// A failed scan is not an answer worth keeping for the next reads.
+		entry.targets.catch(() => {
+			if (cached === entry) cached = undefined;
+		});
+		return entry.targets;
 	};
 
 	const openTarget = async (target: OpenTarget, resolved: ResolvedCommand | undefined, directory: string, revealPath?: string) => {
@@ -576,20 +683,21 @@ export function createEditorHandoff(deps: EditorHandoffDeps): EditorHandoff {
 				return;
 			}
 			if (!isEditorId(input.editorId)) throw new Error("That editor is not supported.");
-			const editor = resolveEditors().find(({ target }) => target.id === input.editorId);
+			const editor = (await installedTargets(true)).editors.find(({ target }) => target.id === input.editorId);
 			if (!editor) throw new Error("That editor is not installed. Choose another option.");
 			// Batch shims and terminal editors use cmd.exe, which expands percent variables even in quotes.
 			const command = editor.command.command;
 			if (deps.platform === "win32" && /[%!"]/.test(realTarget) && (/\.(?:cmd|bat)$/i.test(command) || api.basename(command).toLowerCase() === "cmd.exe")) {
 				throw new Error("That path cannot be passed safely to this editor launcher.");
 			}
-			const cwd = isDirectory(realTarget) ? realTarget : api.dirname(realTarget);
+			const cwd = (await probes.isDirectory(realTarget)) ? realTarget : api.dirname(realTarget);
 			await deps.launch(editor.command.command, (editor.command.argsForFile ?? editor.command.argsForWorkspace)(realTarget), cwd);
 		},
 		async getState(sessionId, options) {
-			if (options?.refreshTerminals === true) await refreshTerminals();
-			const editors = resolveEditors();
-			const terminals = resolveTerminals();
+			// Opening a menu asks for a refresh: look again for anything newly installed.
+			const refresh = options?.refreshTerminals === true;
+			if (refresh) await refreshTerminals();
+			const { editors, terminals } = await installedTargets(refresh);
 			// Linux's generic launcher may be the same binary (or an alternatives
 			// symlink) as a named terminal. Show it only as a fallback in the menu;
 			// the generic target remains available to existing shortcut/artifact callers.
@@ -629,12 +737,13 @@ export function createEditorHandoff(deps: EditorHandoffDeps): EditorHandoff {
 		},
 
 		async getEditors() {
-			return { editors: resolveEditors().map(({ target }) => target), preferredEditorId: await deps.readPreference() };
+			const { editors } = await installedTargets(true);
+			return { editors: editors.map(({ target }) => target), preferredEditorId: await deps.readPreference() };
 		},
 
 		async setPreferredEditor(editorId) {
 			if (!isEditorId(editorId)) throw new Error("That editor is not supported.");
-			if (!resolveEditors().some(({ target }) => target.id === editorId)) {
+			if (!(await installedTargets(true)).editors.some(({ target }) => target.id === editorId)) {
 				throw new Error("That editor is not installed. Choose another option.");
 			}
 			await deps.writePreference(editorId);
@@ -649,8 +758,11 @@ export function createEditorHandoff(deps: EditorHandoffDeps): EditorHandoff {
 			if (input.targetId && input.targetId !== "file-manager" && !isTerminalId(input.targetId) && !isEditorId(input.targetId)) {
 				throw new Error("That open target is not supported.");
 			}
-			const entry = targetId === "file-manager" ? undefined
-				: (isTerminalId(targetId) ? resolveTerminals() : resolveEditors()).find(({ target }) => target.id === targetId);
+			let entry: ResolvedTarget | undefined;
+			if (targetId !== "file-manager") {
+				const { editors, terminals } = await installedTargets(true);
+				entry = (isTerminalId(targetId) ? terminals : editors).find(({ target }) => target.id === targetId);
+			}
 			const target = targetId === "file-manager" ? fileManager : entry?.target;
 			if (!target) {
 				if (isEditorId(targetId)) throw new Error("That editor is not installed. Choose another option.");
@@ -669,7 +781,9 @@ export function createEditorHandoff(deps: EditorHandoffDeps): EditorHandoff {
 			if (input.targetId !== "file-manager" && input.targetId !== "terminal") {
 				throw new Error("That open target is not supported.");
 			}
-			const terminal = input.targetId === "terminal" ? resolveTerminal(deps, isExecutable) : undefined;
+			// Only the system terminal opens here, so look up its launchers alone.
+			const terminal = input.targetId === "terminal"
+				? resolveTerminal(deps, await resolveTerminalLaunchers(deps, createTargetScan(deps, probes))) : undefined;
 			const target = input.targetId === "file-manager" ? fileManager : terminal?.target;
 			if (!target) throw new Error("That open target is not available.");
 			const artifactDir = await deps.resolveArtifactDir(sessionId);
