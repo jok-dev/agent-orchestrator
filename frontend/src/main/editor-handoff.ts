@@ -1,6 +1,6 @@
 import { terminalCommand, LINUX_TERMINAL_LAUNCHERS } from "./terminal-command";
 import { createHash } from "node:crypto";
-import { closeSync, constants, openSync, readSync, statSync } from "node:fs";
+import { closeSync, constants, openSync, readdirSync, readSync, statSync } from "node:fs";
 import path from "node:path";
 import {
 	isEditorId,
@@ -126,13 +126,60 @@ export type EditorHandoff = {
 	copyWorkspacePath(sessionId: string): Promise<void>;
 };
 
-function defaultIsExecutable(candidatePath: string, platform: Platform): boolean {
-	try {
-		const stat = statSync(candidatePath);
-		return stat.isFile() && (platform === "win32" || (stat.mode & constants.X_OK) !== 0);
-	} catch {
-		return false;
-	}
+/** How long a Windows directory listing answers probes before it is read again. */
+const DIRECTORY_LISTING_TTL_MS = 30_000;
+
+type ExecutableProbeFs = {
+	readdirSync: (directory: string) => string[];
+	statSync: (candidatePath: string) => { isFile(): boolean; mode: number };
+};
+
+/**
+ * Answers "is this path an executable file". On Windows a command is tried under
+ * every PATHEXT extension in every PATH directory, and nearly all of those names
+ * do not exist: one stat each blocked the main process for seconds on a long
+ * PATH. There, each directory is listed once and only a name it holds is
+ * stat'ed. `reset` drops the listings so an explicit refresh sees new installs.
+ */
+export function createExecutableProbe(
+	platform: Platform,
+	fs: ExecutableProbeFs = { readdirSync, statSync },
+	now: () => number = Date.now,
+): { isExecutable: (candidatePath: string) => boolean; reset: () => void } {
+	const isExecutableFile = (candidatePath: string) => {
+		try {
+			const stat = fs.statSync(candidatePath);
+			return stat.isFile() && (platform === "win32" || (stat.mode & constants.X_OK) !== 0);
+		} catch {
+			return false;
+		}
+	};
+	if (platform !== "win32") return { isExecutable: isExecutableFile, reset: () => {} };
+	// Lowercased names per directory; undefined when it could not be listed for a
+	// reason other than not existing, so its files are still stat'ed directly.
+	const listings = new Map<string, { names: Set<string> | undefined; readAt: number }>();
+	const namesIn = (directory: string) => {
+		const key = directory.toLowerCase();
+		const cached = listings.get(key);
+		if (cached && now() - cached.readAt < DIRECTORY_LISTING_TTL_MS) return cached.names;
+		let names: Set<string> | undefined;
+		try {
+			names = new Set(fs.readdirSync(directory).map((name) => name.toLowerCase()));
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			names = code === "ENOENT" || code === "ENOTDIR" ? new Set() : undefined;
+		}
+		listings.set(key, { names, readAt: now() });
+		return names;
+	};
+	return {
+		isExecutable: (candidatePath) => {
+			const names = namesIn(path.win32.dirname(candidatePath));
+			if (names && !names.has(path.win32.basename(candidatePath).toLowerCase())) return false;
+			return isExecutableFile(candidatePath);
+		},
+		reset: () => listings.clear(),
+	};
 }
 
 function defaultReadFileHead(candidatePath: string): string | undefined {
@@ -448,7 +495,8 @@ function resolveInstalledTerminals(
 }
 
 export function createEditorHandoff(deps: EditorHandoffDeps): EditorHandoff {
-	const isExecutable = deps.isExecutable ?? ((candidatePath) => defaultIsExecutable(candidatePath, deps.platform));
+	const executableProbe = deps.isExecutable ? undefined : createExecutableProbe(deps.platform);
+	const isExecutable = deps.isExecutable ?? executableProbe!.isExecutable;
 	const isDirectory = deps.isDirectory ?? defaultIsDirectory;
 	const readFileHead = deps.readFileHead ?? defaultReadFileHead;
 	const fileManager: OpenTarget = {
@@ -587,7 +635,11 @@ export function createEditorHandoff(deps: EditorHandoffDeps): EditorHandoff {
 			await deps.launch(editor.command.command, (editor.command.argsForFile ?? editor.command.argsForWorkspace)(realTarget), cwd);
 		},
 		async getState(sessionId, options) {
-			if (options?.refreshTerminals === true) await refreshTerminals();
+			if (options?.refreshTerminals === true) {
+				// The menu was opened: show an editor installed since the last listing.
+				executableProbe?.reset();
+				await refreshTerminals();
+			}
 			const editors = resolveEditors();
 			const terminals = resolveTerminals();
 			// Linux's generic launcher may be the same binary (or an alternatives
