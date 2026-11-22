@@ -468,6 +468,13 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 	}, [onSelectChat, uiSessionId]);
 	const sideEnabled = useSideChatsAvailable(session, hostId) && !unavailable;
 	const sideCreationEnabled = sideEnabled && Boolean(snapshot && can(snapshot, "resume"));
+	// The same list for as long as its inputs are. Every human message reads it
+	// from context to mark the skills it sent, so a list rebuilt on each render
+	// re-rendered all of them, behind the memoised turn groups.
+	const offeredSkills = useMemo(
+		() => sideCreationEnabled ? [...(["btw"].map((name) => ({ name, displayName: name, description: "Open a new side chat", source: "AO" }))), ...skills.filter((skill) => skill.name !== "btw")] : skills,
+		[sideCreationEnabled, skills],
+	);
 	const openSideInspector = () => {
 		const ui = useUiStore.getState();
 		ui.setInspectorView(uiSessionId, "sideChat");
@@ -919,7 +926,7 @@ export const SessionChatSurface = memo(function SessionChatSurface({
 				activateBranchDisabled={commands.activateBranchDisabled}
 				activateBranchTarget={commands.activateBranchTarget}
 				activateBranchError={commands.activateBranchError}
-				skills={sideCreationEnabled ? [...(["btw"].map((name) => ({ name, displayName: name, description: "Open a new side chat", source: "AO" }))), ...skills.filter((skill) => skill.name !== "btw")] : skills}
+				skills={offeredSkills}
 				skillsLoading={skillsLoading}
 				filePaths={paths}
 				filePathsTruncated={truncated}
